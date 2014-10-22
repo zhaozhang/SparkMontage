@@ -160,13 +160,13 @@ object madd {
     }
     
     //Main program entrance
-    val flist = new File("/Users/zhaozhang/projects/Montage/m101/corrdir/").listFiles.filter(_.getName.endsWith(".fits"))
+    val flist = new File("resources/corrdir/").listFiles.filter(_.getName.endsWith(".fits"))
     
     val fitslist = (for(i<-0 until flist.length) yield readfits(flist(i).toString)).toArray
     
     val map = processMeta(fitslist)
     
-    val template = new Template("/Users/zhaozhang/projects/Montage/m101/template.hdr")
+    val template = new Template("resources/template.hdr")
         
     val matrix = add(fitslist, map, template.tcol, template.trow)
     
