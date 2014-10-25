@@ -15,12 +15,27 @@
  */
 package edu.berkeley.cs.amplab.madd
 
+import edu.berkeley.cs.amplab.madd.avro.FitsValue
 import edu.berkeley.cs.amplab.madd.models._
 import edu.berkeley.cs.amplab.madd.util.FitsUtils
 import java.io._
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.SparkContext._
 import org.apache.spark.{ SparkConf, SparkContext }
 import org.apache.spark.rdd.RDD
+import parquet.avro.{
+  AvroParquetInputFormat,
+  AvroParquetOutputFormat,
+  AvroReadSupport
+}
+import parquet.filter.UnboundRecordFilter
+import parquet.hadoop.{
+  ParquetInputFormat,
+  ParquetOutputFormat
+}
+import parquet.hadoop.util.ContextUtil
+import parquet.hadoop.metadata.CompressionCodecName
 import scala.annotation.tailrec
 
 object SparkMadd extends Serializable {
@@ -28,24 +43,69 @@ object SparkMadd extends Serializable {
 
     def parallelize(f: Fits,
                     metadata: FitsMetadata,
-                    sc: SparkContext): RDD[(Coordinate, Float)] = {
+                    sc: SparkContext): RDD[FitsValue] = {
       sc.parallelize(f.matrix.zipWithIndex.flatMap(vk => {
         val (array, idx) = vk
 
-        if (idx <= metadata.length) {
-          array.zipWithIndex.flatMap(vk2 => {
-            val (value, jdx) = vk2
+        array.zipWithIndex.map(vk2 => {
+          val (value, jdx) = vk2
 
-            if (value.isNaN || value.isInfinite) {
-              None
-            } else {
-              Some((Coordinate(idx + metadata.start, jdx + metadata.offset), value))
-            }
-          })
-        } else {
-          Iterable[(Coordinate, Float)]()
-        }
+          FitsValue.newBuilder()
+            .setXPos(idx)
+            .setYPos(jdx)
+            .setValue(value)
+            .setStart(metadata.start)
+            .setEnd(metadata.end)
+            .setOffset(metadata.offset)
+            .build()
+        })
       }))
+    }
+
+    /**
+     * Create a job using either the Hadoop 1 or 2 API
+     * @param sc A Spark context
+     */
+    def newJob(sc: SparkContext): Job = {
+      newJobFromConfig(sc.hadoopConfiguration)
+    }
+
+    def newJobFromConfig(config: Configuration): Job = {
+      val jobClass: Class[_] = Class.forName("org.apache.hadoop.mapreduce.Job")
+      try {
+        // Use the getInstance method in Hadoop 2
+        jobClass.getMethod("getInstance", classOf[Configuration]).invoke(null, config).asInstanceOf[Job]
+      } catch {
+        case ex: NoSuchMethodException =>
+          // Drop back to Hadoop 1 constructor
+          jobClass.getConstructor(classOf[Configuration]).newInstance(config).asInstanceOf[Job]
+      }
+    }
+
+    def save(rdd: RDD[FitsValue],
+             job: Job,
+             filePath: String,
+             blockSize: Int = 128 * 1024 * 1024,
+             pageSize: Int = 1 * 1024 * 1024,
+             compressCodec: CompressionCodecName = CompressionCodecName.GZIP,
+             disableDictionaryEncoding: Boolean = false) {
+
+      // configure parquet
+      ParquetOutputFormat.setCompression(job, compressCodec)
+      ParquetOutputFormat.setEnableDictionary(job, !disableDictionaryEncoding)
+      ParquetOutputFormat.setBlockSize(job, blockSize)
+      ParquetOutputFormat.setPageSize(job, pageSize)
+      AvroParquetOutputFormat.setSchema(job, new FitsValue().getSchema)
+
+      // Add the Void Key
+      val recordToSave = rdd.map(p => (null, p))
+
+      // Save the values to the parquet file
+      recordToSave.saveAsNewAPIHadoopFile(filePath,
+        classOf[java.lang.Void],
+        classOf[FitsValue],
+        classOf[AvroParquetOutputFormat],
+        ContextUtil.getConfiguration(job))
     }
 
     val conf = new SparkConf().setAppName("SparkMadd")
@@ -55,7 +115,7 @@ object SparkMadd extends Serializable {
     val sc = new SparkContext(conf)
 
     @tailrec def buildUp(datasets: Iterator[(Fits, FitsMetadata)],
-                         lastRdd: RDD[(Coordinate, Float)] = sc.parallelize(Array[(Coordinate, Float)]())): RDD[(Coordinate, Float)] = {
+                         lastRdd: RDD[FitsValue] = sc.parallelize(Array[FitsValue]())): RDD[FitsValue] = {
       if (!datasets.hasNext) {
         lastRdd
       } else {
@@ -72,30 +132,57 @@ object SparkMadd extends Serializable {
       }
     }
 
-    def add(rdd: RDD[(Coordinate, Float)],
+    def add(rdd: RDD[FitsValue],
             tcol: Int,
-            trow: Int): Array[Array[Float]] = {
-      // create inital matrix
-      val matrix = Array.fill[Float](tcol, trow)(Float.NaN)
-
+            trow: Int): RDD[FitsValue] = {
       // populate matrix
-      rdd.filter(kv => {
-        val (idx, _) = kv
-        idx.x < tcol && idx.y < trow
+      rdd.flatMap(v => {
+        val coords = Coordinate(v.getXPos + v.getStart, v.getYPos + v.getOffset)
+
+        if (coords.x < tcol && coords.y < trow) {
+          Some((coords, v.getValue))
+        } else {
+          None
+        }
       }).groupByKey()
         .map(kv => {
           val (idx, values) = kv
 
-          (idx, values.sum / values.size.toFloat)
-        }).toLocalIterator
-        .foreach(kv => {
-          val (idx, value) = kv
-
-          matrix(idx.x)(idx.y) = value
+          FitsValue.newBuilder()
+            .setXPos(idx.x)
+            .setYPos(idx.y)
+            .setValue(values.reduce(_ + _) / values.size.toFloat)
+            .setStart(0)
+            .setEnd(tcol)
+            .setHeight(trow)
+            .setOffset(0)
+            .build()
         })
+    }
+
+    def buildMatrix(rdd: RDD[FitsValue]): Array[Array[Float]] = {
+      // cache rdd
+      rdd.cache()
+
+      // get first entry, to get matrix dimensions
+      val one = rdd.first
+
+      // build matrix
+      val matrix = Array.fill[Float](one.getEnd, one.getHeight)(Float.NaN)
+
+      // iterate over rdd and build matrix
+      rdd.toLocalIterator.map(v => {
+        matrix(v.getXPos)(v.getYPos) = v.getValue
+      })
+
+      // unpersist rdd
+      rdd.unpersist()
 
       matrix
     }
+
+    // create job
+    val job = newJob(sc)
 
     //Main program entrance
     val flist = new File("resources/corrdir/").listFiles.filter(_.getName.endsWith(".fits"))
@@ -110,8 +197,35 @@ object SparkMadd extends Serializable {
     // parallelize files
     val fitsRdd = buildUp(fitsList.zip(map).toIterator)
 
+    // save to parquet
+    save(fitsRdd, job, "resources/tmp_parquet")
+    fitsRdd.unpersist()
+
+    // load back from parquet, just because
+    ParquetInputFormat.setReadSupportClass(job, classOf[AvroReadSupport[FitsValue]])
+    val records = sc.newAPIHadoopFile("resources/tmp_parquet",
+      classOf[ParquetInputFormat[FitsValue]],
+      classOf[Void],
+      classOf[FitsValue],
+      ContextUtil.getConfiguration(job)).map(p => p._2)
+
     // reduce down to matrix
-    val matrix = add(fitsRdd, template.tcol, template.trow)
+    val matrixRdd = add(records, template.tcol, template.trow)
+
+    // save to parquet
+    save(matrixRdd, job, "resources/final_parquet")
+    matrixRdd.unpersist()
+
+    // again, load back from parquet, just because
+    ParquetInputFormat.setReadSupportClass(job, classOf[AvroReadSupport[FitsValue]])
+    val reloadedMatrixRdd = sc.newAPIHadoopFile("resources/final_parquet",
+      classOf[ParquetInputFormat[FitsValue]],
+      classOf[Void],
+      classOf[FitsValue],
+      ContextUtil.getConfiguration(job)).map(p => p._2)
+
+    // build matrix
+    val matrix = buildMatrix(reloadedMatrixRdd)
 
     // save output
     FitsUtils.createFits(template, matrix, "final.fits")
