@@ -15,8 +15,5 @@
  */
 package edu.berkeley.cs.amplab.madd.models
 
-case class FitsMetadata(start: Int, end: Int, offset: Int) {
-
-  val length = end - start + 1
+case class Coordinate(x: Int, y: Int) {
 }
-
