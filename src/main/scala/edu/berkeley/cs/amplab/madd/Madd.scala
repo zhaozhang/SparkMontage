@@ -1,177 +1,105 @@
+/*
+ * Copyright (c) 2014. Regents of the University of California
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package edu.berkeley.cs.amplab.madd
 
-import org.eso.fits._
+import edu.berkeley.cs.amplab.madd.models._
+import edu.berkeley.cs.amplab.madd.util.FitsUtils
 import java.io._
-import scala.io.Source
 
 object Madd {
   def main(args: Array[String]) {
-    class Fits(val path: String, val naxis: Array[Int], val crpix: Array[Double], val ncol: Int, val matrix: Array[Array[Float]]) {
-      def getPath = path
-      def getNaxis = naxis
-      def getCrpix = crpix
-      def getNcol = ncol
-      def getMatrix = matrix
-    }
 
-    def readfits(path: String): Fits = {
-      val file = new FitsFile(path)
-      val hdu: FitsHDUnit = file.getHDUnit(0)
-      val hdr = hdu.getHeader()
+    /**
+     * Given an array of Fits datasets, maps them into a 2D matrix and
+     * averages out the values.
+     *
+     * @param fitsList
+     */
+    def add(fitsList: Array[Fits],
+            metadata: Map[Int, FitsMetadata],
+            tcol: Int,
+            trow: Int): Array[Array[Float]] = {
 
-      val dm: FitsMatrix = hdu.getData().asInstanceOf[FitsMatrix]
-      val naxis = dm.getNaxis()
-      val crpix = dm.getCrpix()
-      val ncol = naxis(0)
-      val nval = dm.getNoValues()
-      val nrow = nval / ncol
-
-      var matrix = Array.ofDim[Float](nrow, ncol)
-      (0 until nrow) map (i => dm.getFloatValues(i * ncol, ncol, matrix(i)))
-
-      val f = new Fits(path, naxis, crpix, ncol, matrix)
-      f
-    }
-
-    def processMeta(fitslist: Array[Fits]): Map[String, Map[String, Int]] = {
-      val crpix1l = ((0 until fitslist.length) map (i => fitslist(i).getCrpix(1))).toList
-      val crpix1max = crpix1l.max
-
-      val crpix0l = ((0 until fitslist.length) map (i => fitslist(i).getCrpix(0))).toList
-      val crpix0max = crpix0l.max
-
-      val start = ((0 until fitslist.length) map (i => (crpix1max - fitslist(i).getCrpix(1) + 1).toInt)).toList
-      val end = ((0 until fitslist.length) map (i => (start(i) + fitslist(i).getNaxis(1) - 1).toInt)).toList
-      val offset = ((0 until fitslist.length) map (i => (crpix0max - fitslist(i).getCrpix(0)).toInt)).toList
-
-      var map = Map[String, Map[String, Int]]()
-      (0 until fitslist.length) map (i => map += (i.toString -> Map("start" -> start(i), "end" -> end(i), "offset" -> offset(i))))
-      map
-
-    }
-
-    def add(fitslist: Array[Fits], map: Map[String, Map[String, Int]], tcol: Int, trow: Int): Array[Array[Float]] = {
+      // create and initialize array
       val matrix = Array.ofDim[Float](trow, tcol)
       for {
         i <- (0 until trow)
         j <- (0 until tcol)
       } matrix(i)(j) = Float.NaN
 
-      val l = (1 to trow) map (i => (0 until fitslist.length) filter (x => i - map(x.toString)("start") >= 0 && i - map(x.toString)("end") < 0))
-      val lmap = (1 to trow) zip l
+      val l = (1 to trow).map(i => (0 until fitsList.length)
+        .filter(x => i - metadata(x).start >= 0 && i - metadata(x).end < 0))
+      val lmap = (1 to trow).zip(l)
 
-      lmap map {
-        case (row, flist) => {
-          var array2d = Array.ofDim[Float](flist.length, tcol)
-          for {
-            i <- (0 until flist.length)
-            j <- (0 until tcol)
-          } array2d(i)(j) = Float.NaN
+      lmap.map(kv => {
+        val (row, flist) = kv
 
-          for ((x, i) <- flist zipWithIndex) {
-            var offset = map(x.toString)("offset")
-            var start = map(x.toString)("start")
-            Array.copy(fitslist(x).matrix(row - start), 0, array2d(i), offset, fitslist(x).ncol)
+        // initialize an array with NaNs
+        var array2d = Array.fill[Float](flist.length, tcol)(Float.NaN)
+
+        flist.zipWithIndex.map(kv => {
+          val (x, i) = kv
+
+          // get offset and start
+          val offset = metadata(x).offset
+          val start = metadata(x).start
+
+          // copy columns into the 2d matrix
+          Array.copy(fitsList(x).matrix(row - start), 0, array2d(i), offset, fitsList(x).ncol)
+        })
+
+        // averages the values of a single column
+        def avgColumn(c: Int): Float = {
+          // get the c'th element from each row that isn't a NaN
+          val cThNonNaNs = array2d.map(r => r(c))
+            .filter(!_.isNaN)
+
+          // get the number of non-NaN values in that column
+          val count = cThNonNaNs.length
+
+          // if we have more than one value, average it, else emit a NaN
+          if (count > 0) {
+            cThNonNaNs.sum / count
+          } else {
+            Float.NaN
           }
-
-          def avgColumn(c: Int): Float = {
-            var sum: Float = 0
-            var count: Int = 0
-            for (r <- (0 until flist.length)) {
-              if (!java.lang.Float.isNaN(array2d(r)(c))) {
-                sum = sum + array2d(r)(c)
-                count = count + 1
-              }
-            }
-            if (count > 0) {
-              sum / count
-            } else {
-              Float.NaN
-            }
-          }
-
-          var array = (for (c <- (0 until tcol))
-            yield avgColumn(c)).toArray
-
-          Array.copy(array, 0, matrix(row - 1), 0, tcol)
         }
-      }
+
+        // average out the columns
+        var array = (0 until tcol).map(avgColumn).toArray
+
+        // copy the averaged array back into the matrix
+        Array.copy(array, 0, matrix(row - 1), 0, tcol)
+      })
+
+      // return the averaged matrix
       matrix
-    }
-
-    def createFits(template: Template, matrix: Array[Array[Float]], path: String) {
-      val tcol = template.tcol
-      val trow = template.trow
-      val naxis = Array(tcol, trow)
-      val nax = tcol * trow
-      var data = new Array[Float](nax)
-      for (i <- 0 until nax) data(i) = Float.NaN
-
-      for (i <- 0 until trow) {
-        Array.copy(matrix(i), 0, data, i * tcol, tcol)
-      }
-
-      var hdu: FitsHDUnit = null
-      var mtx: FitsMatrix = new FitsMatrix(Fits.DOUBLE, naxis)
-      mtx.setFloatValues(0, data)
-
-      mtx.setCrpix(template.crpix)
-      mtx.setCrval(template.crval)
-      mtx.setCdelt(template.cdelt)
-
-      var hdr: FitsHeader = mtx.getHeader()
-      hdr.addKeyword(new FitsKeyword("", ""))
-      var fitsWCS = new FitsWCS(hdr)
-
-      hdr.addKeyword(new FitsKeyword("CTYPE1", "= " + template.ctype(0)))
-      hdr.addKeyword(new FitsKeyword("CTYPE2", "= " + template.ctype(1)))
-
-      hdu = new FitsHDUnit(hdr, mtx)
-
-      var file: FitsFile = new FitsFile()
-      file.addHDUnit(hdu)
-      file.writeFile(path)
-    }
-
-    def findmax(fitslist: Array[Fits]) {
-      var max: Float = 0
-      for (f <- fitslist) {
-        for (i <- 0 until f.matrix.length) {
-          for (j <- 0 until f.ncol) {
-            if (f.matrix(i)(j) > max)
-              max = f.matrix(i)(j)
-          }
-        }
-      }
-      println("max: " + max)
-    }
-
-    class Template(val path: String) {
-      var kmap: Map[String, String] = Map()
-      for (line <- Source.fromFile(path).getLines()) {
-        var words = (line.split('=') map (x => x.trim))
-        if (words.length > 1)
-          kmap += (words(0) -> words(1))
-      }
-      def tcol = kmap("NAXIS1").toInt
-      def trow = kmap("NAXIS2").toInt
-      def crpix: Array[Double] = Array(kmap("CRPIX1").toFloat, kmap("CRPIX2").toFloat)
-      def crval: Array[Double] = Array(kmap("CRVAL1").toFloat, kmap("CRVAL2").toFloat)
-      def cdelt: Array[Double] = Array(kmap("CDELT1").toFloat, kmap("CDELT2").toFloat)
-      def ctype: Array[String] = Array(kmap("CTYPE1"), kmap("CTYPE2"))
     }
 
     //Main program entrance
     val flist = new File("resources/corrdir/").listFiles.filter(_.getName.endsWith(".fits"))
 
-    val fitslist = (for (i <- 0 until flist.length) yield readfits(flist(i).toString)).toArray
+    val fitsList = (0 until flist.length).map(i => FitsUtils.readFits(flist(i).toString)).toArray
 
-    val map = processMeta(fitslist)
+    val map = FitsUtils.processMeta(fitsList)
 
     val template = new Template("resources/template.hdr")
 
-    val matrix = add(fitslist, map, template.tcol, template.trow)
+    val matrix = add(fitsList, map, template.tcol, template.trow)
 
-    createFits(template, matrix, "final.fits")
+    FitsUtils.createFits(template, matrix, "final.fits")
   }
 }
