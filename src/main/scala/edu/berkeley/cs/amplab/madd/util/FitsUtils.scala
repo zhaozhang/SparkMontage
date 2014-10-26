@@ -95,14 +95,8 @@ object FitsUtils {
     // populate the axis array
     val naxis = Array(tcol, trow)
 
-    // compute the number of points in the set and allocate a linear array
-    val nax = tcol * trow
-    var data = Array.fill[Float](nax)(Float.NaN)
-
-    // copy rows into the array we've just allocated
-    for (i <- 0 until trow) {
-      Array.copy(matrix(i), 0, data, i * tcol, tcol)
-    }
+    // flat map the matrix down into a single long array
+    val data = matrix.flatMap(a => a)
 
     // allocate header unit and matrix
     val mtx: FitsMatrix = new FitsMatrix(ESOFits.DOUBLE, naxis)
