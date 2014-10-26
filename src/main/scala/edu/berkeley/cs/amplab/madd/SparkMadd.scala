@@ -172,7 +172,7 @@ object SparkMadd extends Serializable {
 
       // iterate over rdd and build matrix
       rdd.toLocalIterator.map(v => {
-        matrix(v.getXPos)(v.getYPos) = v.getValue
+        matrix(v.getXPos - 1)(v.getYPos) = v.getValue
       })
 
       // unpersist rdd
