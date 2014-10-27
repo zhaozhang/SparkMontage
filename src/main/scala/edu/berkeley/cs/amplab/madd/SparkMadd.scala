@@ -137,21 +137,23 @@ object SparkMadd extends Serializable {
             trow: Int): RDD[FitsValue] = {
       // populate matrix
       rdd.flatMap(v => {
-        val coords = Coordinate(v.getXPos + v.getStart, v.getYPos + v.getOffset)
+        val coords = Coordinate(v.getXPos + v.getStart - 1, v.getYPos + v.getOffset)
 
-        if (coords.x < tcol && coords.y < trow) {
-          Some((coords, v.getValue))
+        if (coords.x < trow && coords.y < tcol) {
+          Some((coords, v.getValue.toFloat))
         } else {
           None
         }
       }).groupByKey()
         .map(kv => {
           val (idx, values) = kv
+          val l = values.filter(x => !x.isNaN)
+          val v = if (l.size > 0) l.reduce(_ + _) / l.size else Float.NaN
 
           FitsValue.newBuilder()
             .setXPos(idx.x)
             .setYPos(idx.y)
-            .setValue(values.reduce(_ + _) / values.size.toFloat)
+            .setValue(v)
             .setStart(0)
             .setEnd(tcol)
             .setHeight(trow)
@@ -168,11 +170,11 @@ object SparkMadd extends Serializable {
       val one = rdd.first
 
       // build matrix
-      val matrix = Array.fill[Float](one.getEnd, one.getHeight)(Float.NaN)
+      val matrix = Array.fill[Float](one.getHeight, one.getEnd)(Float.NaN)
 
       // iterate over rdd and build matrix
-      rdd.toLocalIterator.map(v => {
-        matrix(v.getXPos - 1)(v.getYPos) = v.getValue
+      rdd.toLocalIterator.foreach(v => {
+        matrix(v.getXPos)(v.getYPos) = v.getValue
       })
 
       // unpersist rdd
@@ -189,7 +191,7 @@ object SparkMadd extends Serializable {
 
     // get data and metadata
     val fitsList = (0 until flist.length).map(i => FitsUtils.readFits(flist(i).toString)).toArray
-    val map = FitsUtils.processMeta(fitsList).map(kv => kv._2)
+    val map = FitsUtils.processMeta(fitsList).toSeq.sortBy(_._1).map(kv => kv._2)
 
     // get template
     val template = new Template("resources/template.hdr")
@@ -229,5 +231,8 @@ object SparkMadd extends Serializable {
 
     // save output
     FitsUtils.createFits(template, matrix, "final.fits")
+    /*val matrixRdd = add(fitsRdd, template.tcol, template.trow)
+    val matrix = buildMatrix(matrixRdd)
+    FitsUtils.createFits(template, matrix, "final.fits")*/
   }
 }
