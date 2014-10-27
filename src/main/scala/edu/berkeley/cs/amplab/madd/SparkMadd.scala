@@ -203,6 +203,7 @@ object SparkMadd extends Serializable {
     save(fitsRdd, job, "resources/tmp_parquet")
     fitsRdd.unpersist()
 
+    val start = System.currentTimeMillis()
     // load back from parquet, just because
     ParquetInputFormat.setReadSupportClass(job, classOf[AvroReadSupport[FitsValue]])
     val records = sc.newAPIHadoopFile("resources/tmp_parquet",
@@ -226,6 +227,8 @@ object SparkMadd extends Serializable {
       classOf[FitsValue],
       ContextUtil.getConfiguration(job)).map(p => p._2)
 
+    val end = System.currentTimeMillis()
+    println("madd in parquet takes: " + (end - start).toFloat / 1000)
     // build matrix
     val matrix = buildMatrix(reloadedMatrixRdd)
 
